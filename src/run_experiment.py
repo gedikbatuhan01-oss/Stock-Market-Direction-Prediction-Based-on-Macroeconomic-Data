@@ -17,12 +17,12 @@ from src.data.labeling import (
 from src.data.load_data import load_market_data
 from src.data.preprocess import apply_missing_value_policy, select_columns
 from src.data.sequence_builder import (
-    build_sequences,
-    drop_neutral_sequences,
+    build_sequences_for_endpoints,
     flatten_sequences,
 )
 from src.data.splitters import make_expanding_folds, split_dev_test
 from src.evaluation.metrics import summarize_fold_metrics
+from src.evaluation.metrics import compute_classification_metrics
 from src.evaluation.reports import (
     append_experiment_summary,
     save_experiment_report,
@@ -34,9 +34,12 @@ from src.models.model_factory import (
     requires_sequence_input,
 )
 from src.training.trainer import (
+    build_probability_threshold_grid,
     evaluate_sklearn_model,
     evaluate_torch_model,
-    run_single_sklearn_fold,
+    optimize_probability_threshold,
+    predict_proba,
+    predict_proba_torch_model,
     run_single_torch_fold,
     train_sklearn_model,
     extract_sklearn_training_history,
@@ -100,21 +103,44 @@ def get_weighted_loss_flag(config: Dict[str, Any], model_name: str) -> bool:
     return bool(model_cfg.get("weighted_loss", True))
 
 
-def build_labeled_sequences_for_subset(
-    df_subset: pd.DataFrame,
+def make_labelable_endpoint_indices(index_range: range, horizon: int) -> range:
+    """
+    Keep label endpoints inside a split while allowing feature lookback to use
+    earlier rows. The endpoint t is included only when t+horizon remains in the
+    same split range.
+    """
+    if horizon < 1:
+        raise ValueError("horizon must be at least 1.")
+
+    stop = index_range.stop - horizon
+    if stop <= index_range.start:
+        return range(index_range.start, index_range.start)
+    return range(index_range.start, stop)
+
+
+def build_labeled_sequences_for_endpoints(
+    context_df: pd.DataFrame,
     feature_cols: List[str],
     close_col: str,
+    endpoint_indices: range,
     threshold: float,
     lookback: int,
     horizon: int,
     bull_label: int,
     bear_label: int,
     neutral_label: int,
-) -> Tuple[np.ndarray, np.ndarray, pd.Series, pd.DataFrame]:
+) -> Tuple[np.ndarray, np.ndarray, pd.Series, pd.DataFrame, Dict[str, Any]]:
     """
-    Compute returns, labels, sequences, and drop neutral samples for one subset.
+    Compute labels on the chronological context and build endpoint-based windows.
+
+    Feature windows may reach backward before the endpoint split, but label
+    endpoints are supplied by the caller and must remain inside the split.
     """
-    returns = compute_forward_return(df_subset[close_col], horizon=horizon)
+    labelable_endpoints = make_labelable_endpoint_indices(endpoint_indices, horizon=horizon)
+    if len(labelable_endpoints) == 0:
+        raise ValueError("No labelable endpoints remain after applying horizon.")
+
+    returns = compute_forward_return(context_df[close_col], horizon=horizon)
     labels = make_labels(
         returns=returns,
         threshold=threshold,
@@ -123,22 +149,115 @@ def build_labeled_sequences_for_subset(
         neutral_label=neutral_label,
     )
 
-    X_seq, y, timestamps = build_sequences(
-        df=df_subset,
+    X_seq, y, timestamps, endpoints = build_sequences_for_endpoints(
+        df=context_df,
         feature_cols=feature_cols,
         labels=labels,
+        endpoint_indices=labelable_endpoints,
         lookback=lookback,
     )
 
-    X_seq, y, timestamps = drop_neutral_sequences(
-        X=X_seq,
-        y=y,
-        timestamps=timestamps,
-        neutral_value=neutral_label,
+    all_label_summary = summarize_label_distribution(pd.Series(y))
+
+    keep_mask = y != neutral_label
+    X_seq = X_seq[keep_mask]
+    y = y[keep_mask]
+    timestamps = timestamps.loc[keep_mask].reset_index(drop=True)
+    endpoints = endpoints.loc[keep_mask].reset_index(drop=True)
+
+    kept_label_summary = summarize_label_distribution(pd.Series(y))
+    label_diagnostics = {
+        "all_endpoint_labels": all_label_summary.reset_index().to_dict(orient="records"),
+        "kept_binary_labels": kept_label_summary.reset_index().to_dict(orient="records"),
+        "n_neutral_dropped": int((~keep_mask).sum()),
+        "n_endpoints_before_neutral_drop": int(len(keep_mask)),
+        "endpoint_indices": endpoints.astype(int).tolist(),
+    }
+    return X_seq, y, timestamps, kept_label_summary, label_diagnostics
+
+
+def get_threshold_search_grid(config: Dict[str, Any]) -> np.ndarray:
+    decision_cfg = config.get("decision", {})
+    search_cfg = decision_cfg.get("threshold_search", {})
+    if not bool(search_cfg.get("enabled", False)):
+        return np.asarray([float(decision_cfg.get("probability_threshold", 0.50))])
+
+    return build_probability_threshold_grid(
+        start=float(search_cfg.get("start", 0.05)),
+        stop=float(search_cfg.get("stop", 0.95)),
+        step=float(search_cfg.get("step", 0.01)),
     )
 
-    label_summary = summarize_label_distribution(pd.Series(y))
-    return X_seq, y, timestamps, label_summary
+
+def choose_probability_threshold(
+    y_true: np.ndarray,
+    y_prob: np.ndarray,
+    config: Dict[str, Any],
+) -> Dict[str, Any]:
+    decision_cfg = config.get("decision", {})
+    search_cfg = decision_cfg.get("threshold_search", {})
+    default_threshold = float(decision_cfg.get("probability_threshold", 0.50))
+
+    if not bool(search_cfg.get("enabled", False)):
+        return {
+            "selected_threshold": default_threshold,
+            "selected_metric": None,
+            "selected_score": None,
+            "default_threshold": default_threshold,
+            "curve": [],
+        }
+
+    return optimize_probability_threshold(
+        y_true=y_true,
+        y_prob=y_prob,
+        thresholds=get_threshold_search_grid(config),
+        metric=str(search_cfg.get("metric", "mcc")),
+        default_threshold=default_threshold,
+    )
+
+
+def compute_naive_baselines(
+    context_df: pd.DataFrame,
+    y_true: np.ndarray,
+    endpoint_indices: List[int],
+    close_col: str,
+    seed: int,
+) -> Dict[str, Any]:
+    """Evaluate non-learning baselines on the same endpoint set as the model."""
+    y_true = np.asarray(y_true)
+    endpoints = [int(idx) for idx in endpoint_indices]
+    rng = np.random.default_rng(seed)
+
+    baseline_specs: Dict[str, Tuple[np.ndarray, np.ndarray]] = {}
+
+    always_bull = np.ones_like(y_true, dtype=np.int64)
+    baseline_specs["always_bull"] = (always_bull, always_bull.astype(float))
+
+    always_bear = np.zeros_like(y_true, dtype=np.int64)
+    baseline_specs["always_bear"] = (always_bear, always_bear.astype(float))
+
+    random_pred = rng.integers(0, 2, size=len(y_true), dtype=np.int64)
+    baseline_specs["random"] = (random_pred, random_pred.astype(float))
+
+    close_values = context_df[close_col].to_numpy(dtype=float)
+    previous_sign_pred = []
+    for endpoint in endpoints:
+        if endpoint <= 0:
+            previous_sign_pred.append(1)
+            continue
+        previous_return = (close_values[endpoint] / close_values[endpoint - 1]) - 1.0
+        previous_sign_pred.append(1 if previous_return > 0 else 0)
+    previous_sign = np.asarray(previous_sign_pred, dtype=np.int64)
+    baseline_specs["previous_day_sign"] = (previous_sign, previous_sign.astype(float))
+
+    results = {}
+    for name, (y_pred, y_prob) in baseline_specs.items():
+        results[name] = compute_classification_metrics(
+            y_true=y_true,
+            y_pred=y_pred,
+            y_prob=y_prob,
+        )
+    return results
 
 
 def run_cv_for_model_and_scaler(
@@ -170,7 +289,6 @@ def run_cv_for_model_and_scaler(
 
     for fold_idx, (train_range, val_range) in enumerate(folds, start=1):
         train_df = dev_df.iloc[list(train_range)].copy().reset_index(drop=True)
-        val_df = dev_df.iloc[list(val_range)].copy().reset_index(drop=True)
 
         train_returns = compute_forward_return(
             train_df[data_cfg["close_col"]],
@@ -183,10 +301,11 @@ def run_cv_for_model_and_scaler(
             quantile=float(labeling_cfg["threshold_quantile"]),
         )
 
-        X_train_seq, y_train, ts_train, train_label_summary = build_labeled_sequences_for_subset(
-            df_subset=train_df,
+        X_train_seq, y_train, ts_train, train_label_summary, train_label_diagnostics = build_labeled_sequences_for_endpoints(
+            context_df=dev_df,
             feature_cols=data_cfg["feature_cols"],
             close_col=data_cfg["close_col"],
+            endpoint_indices=train_range,
             threshold=threshold,
             lookback=int(seq_cfg["lookback"]),
             horizon=int(labeling_cfg["horizon"]),
@@ -195,10 +314,11 @@ def run_cv_for_model_and_scaler(
             neutral_label=int(labeling_cfg["neutral_label"]),
         )
 
-        X_val_seq, y_val, ts_val, val_label_summary = build_labeled_sequences_for_subset(
-            df_subset=val_df,
+        X_val_seq, y_val, ts_val, val_label_summary, val_label_diagnostics = build_labeled_sequences_for_endpoints(
+            context_df=dev_df,
             feature_cols=data_cfg["feature_cols"],
             close_col=data_cfg["close_col"],
+            endpoint_indices=val_range,
             threshold=threshold,
             lookback=int(seq_cfg["lookback"]),
             horizon=int(labeling_cfg["horizon"]),
@@ -228,37 +348,86 @@ def run_cv_for_model_and_scaler(
         )
 
         if model_family == "sklearn":
-            fold_run = run_single_sklearn_fold(
+            X_train_fit, y_train_fit, X_threshold, y_threshold = split_internal_final_train_val(
+                X_dev_model=X_train_model,
+                y_dev=y_train,
+                val_ratio=float(split_cfg["val_ratio_within_dev"]),
+            )
+            trained_model = train_sklearn_model(
                 model=model,
-                X_train=X_train_model,
-                y_train=y_train,
-                X_val=X_val_model,
-                y_val=y_val,
-                probability_threshold=float(decision_cfg["probability_threshold"]),
+                X_train=X_train_fit,
+                y_train=y_train_fit,
+            )
+            threshold_prob = predict_proba(trained_model, X_threshold)
+            threshold_info = choose_probability_threshold(
+                y_true=y_threshold,
+                y_prob=threshold_prob,
+                config=config,
+            )
+            selected_probability_threshold = float(threshold_info["selected_threshold"])
+            eval_model = build_model(
+                model_name=model_name,
+                config=config,
+                input_shape=tuple(X_train_seq_scaled.shape[1:]),
+            )
+            trained_model = train_sklearn_model(eval_model, X_train_model, y_train)
+            val_results = evaluate_sklearn_model(
+                model=trained_model,
+                X=X_val_model,
+                y_true=y_val,
+                probability_threshold=selected_probability_threshold,
             )
 
-            fold_metrics = fold_run["validation"]["metrics"]
+            fold_metrics = val_results["metrics"]
             trainer_info = {
                 "trainer_type": "sklearn",
                 "best_epoch": None,
                 "best_score": None,
-                "history": fold_run.get("history", []),
+                "history": extract_sklearn_training_history(trained_model),
+                "internal_train_size": int(len(y_train_fit)),
+                "threshold_source": "fold_train_internal_validation",
+                "threshold_optimization": threshold_info,
             }
 
         elif model_family == "torch":
+            X_train_fit, y_train_fit, X_threshold, y_threshold = split_internal_final_train_val(
+                X_dev_model=X_train_model,
+                y_dev=y_train,
+                val_ratio=float(split_cfg["val_ratio_within_dev"]),
+            )
             fold_run = run_single_torch_fold(
                 model=model,
-                X_train=X_train_model,
-                y_train=y_train,
-                X_val=X_val_model,
-                y_val=y_val,
+                X_train=X_train_fit,
+                y_train=y_train_fit,
+                X_val=X_threshold,
+                y_val=y_threshold,
                 training_config=training_cfg,
                 probability_threshold=float(decision_cfg["probability_threshold"]),
                 use_weighted_loss=get_weighted_loss_flag(config, model_name),
                 device=None,
             )
 
-            fold_metrics = fold_run["validation"]["metrics"]
+            threshold_prob = predict_proba_torch_model(
+                model=fold_run["model"],
+                X=X_threshold,
+                batch_size=int(training_cfg.get("batch_size", 64)),
+                device=fold_run.get("device", "cpu"),
+            )
+            threshold_info = choose_probability_threshold(
+                y_true=y_threshold,
+                y_prob=threshold_prob,
+                config=config,
+            )
+            selected_probability_threshold = float(threshold_info["selected_threshold"])
+            val_results = evaluate_torch_model(
+                model=fold_run["model"],
+                X=X_val_model,
+                y_true=y_val,
+                probability_threshold=selected_probability_threshold,
+                batch_size=int(training_cfg.get("batch_size", 64)),
+                device=fold_run.get("device", "cpu"),
+            )
+            fold_metrics = val_results["metrics"]
             trainer_info = {
                 "trainer_type": "torch",
                 "best_epoch": fold_run.get("best_epoch"),
@@ -267,6 +436,9 @@ def run_cv_for_model_and_scaler(
                 "learning_rate_candidates": fold_run.get("learning_rate_candidates"),
                 "lr_search_results": fold_run.get("lr_search_results", []),
                 "history": fold_run.get("history", []),
+                "internal_train_size": int(len(y_train_fit)),
+                "threshold_source": "fold_train_internal_validation",
+                "threshold_optimization": threshold_info,
             }
 
         else:
@@ -278,6 +450,9 @@ def run_cv_for_model_and_scaler(
             "model_family": model_family,
             "scaler_name": scaler_name,
             "threshold": threshold,
+            "label_threshold_quantile": float(labeling_cfg["threshold_quantile"]),
+            "lookback": int(seq_cfg["lookback"]),
+            "selected_probability_threshold": selected_probability_threshold,
             "n_train_samples": int(len(y_train)),
             "n_val_samples": int(len(y_val)),
             "train_start": str(ts_train.iloc[0]) if len(ts_train) else None,
@@ -286,7 +461,16 @@ def run_cv_for_model_and_scaler(
             "val_end": str(ts_val.iloc[-1]) if len(ts_val) else None,
             "train_label_distribution": train_label_summary.reset_index().to_dict(orient="records"),
             "val_label_distribution": val_label_summary.reset_index().to_dict(orient="records"),
+            "train_label_diagnostics": train_label_diagnostics,
+            "val_label_diagnostics": val_label_diagnostics,
             "metrics": fold_metrics,
+            "baselines": compute_naive_baselines(
+                context_df=dev_df,
+                y_true=y_val,
+                endpoint_indices=val_label_diagnostics["endpoint_indices"],
+                close_col=data_cfg["close_col"],
+                seed=int(config["experiment"]["seed"]) + fold_idx,
+            ),
             "trainer_info": trainer_info,
         })
 
@@ -297,6 +481,8 @@ def run_cv_for_model_and_scaler(
         "model_name": model_name,
         "model_family": model_family,
         "scaler_name": scaler_name,
+        "label_threshold_quantile": float(labeling_cfg["threshold_quantile"]),
+        "lookback": int(seq_cfg["lookback"]),
         "fold_results": fold_results,
         "cv_summary": cv_summary,
     }
@@ -369,6 +555,9 @@ def run_final_train_and_test(
     training_cfg = config["training"]
 
     model_family = get_model_family(model_name)
+    full_context_df = pd.concat([dev_df, test_df], axis=0, ignore_index=True)
+    dev_range = range(0, len(dev_df))
+    test_range = range(len(dev_df), len(full_context_df))
 
     dev_returns = compute_forward_return(
         dev_df[data_cfg["close_col"]],
@@ -381,10 +570,11 @@ def run_final_train_and_test(
         quantile=float(labeling_cfg["threshold_quantile"]),
     )
 
-    X_dev_seq, y_dev, ts_dev, dev_label_summary = build_labeled_sequences_for_subset(
-        df_subset=dev_df,
+    X_dev_seq, y_dev, ts_dev, dev_label_summary, dev_label_diagnostics = build_labeled_sequences_for_endpoints(
+        context_df=full_context_df,
         feature_cols=data_cfg["feature_cols"],
         close_col=data_cfg["close_col"],
+        endpoint_indices=dev_range,
         threshold=final_threshold,
         lookback=int(seq_cfg["lookback"]),
         horizon=int(labeling_cfg["horizon"]),
@@ -393,10 +583,11 @@ def run_final_train_and_test(
         neutral_label=int(labeling_cfg["neutral_label"]),
     )
 
-    X_test_seq, y_test, ts_test, test_label_summary = build_labeled_sequences_for_subset(
-        df_subset=test_df,
+    X_test_seq, y_test, ts_test, test_label_summary, test_label_diagnostics = build_labeled_sequences_for_endpoints(
+        context_df=full_context_df,
         feature_cols=data_cfg["feature_cols"],
         close_col=data_cfg["close_col"],
+        endpoint_indices=test_range,
         threshold=final_threshold,
         lookback=int(seq_cfg["lookback"]),
         horizon=int(labeling_cfg["horizon"]),
@@ -433,14 +624,36 @@ def run_final_train_and_test(
     }
 
     if model_family == "sklearn":
-        trained_model = train_sklearn_model(model, X_dev_model, y_dev)
+        X_train_final, y_train_final, X_val_internal, y_val_internal = split_internal_final_train_val(
+            X_dev_model=X_dev_model,
+            y_dev=y_dev,
+            val_ratio=float(split_cfg["val_ratio_within_dev"]),
+        )
+        threshold_model = train_sklearn_model(model, X_train_final, y_train_final)
+        threshold_prob = predict_proba(threshold_model, X_val_internal)
+        threshold_info = choose_probability_threshold(
+            y_true=y_val_internal,
+            y_prob=threshold_prob,
+            config=config,
+        )
+        selected_probability_threshold = float(threshold_info["selected_threshold"])
+        final_model = build_model(
+            model_name=model_name,
+            config=config,
+            input_shape=tuple(X_dev_seq_scaled.shape[1:]),
+        )
+        trained_model = train_sklearn_model(final_model, X_dev_model, y_dev)
 
         test_results = evaluate_sklearn_model(
             model=trained_model,
             X=X_test_model,
             y_true=y_test,
-            probability_threshold=float(decision_cfg["probability_threshold"]),
+            probability_threshold=selected_probability_threshold,
         )
+        final_train_info["internal_validation_used"] = True
+        final_train_info["internal_val_size"] = int(len(y_val_internal))
+        final_train_info["threshold_source"] = "development_internal_validation"
+        final_train_info["threshold_optimization"] = threshold_info
 
     elif model_family == "torch":
         X_train_final, y_train_final, X_val_internal, y_val_internal = split_internal_final_train_val(
@@ -462,11 +675,23 @@ def run_final_train_and_test(
         )
 
         trained_model = final_train_run["model"]
+        threshold_prob = predict_proba_torch_model(
+            model=trained_model,
+            X=X_val_internal,
+            batch_size=int(training_cfg.get("batch_size", 64)),
+            device=final_train_run.get("device", "cpu"),
+        )
+        threshold_info = choose_probability_threshold(
+            y_true=y_val_internal,
+            y_prob=threshold_prob,
+            config=config,
+        )
+        selected_probability_threshold = float(threshold_info["selected_threshold"])
         test_results = evaluate_torch_model(
             model=trained_model,
             X=X_test_model,
             y_true=y_test,
-            probability_threshold=float(decision_cfg["probability_threshold"]),
+            probability_threshold=selected_probability_threshold,
             batch_size=int(training_cfg.get("batch_size", 64)),
             device=final_train_run.get("device", "cpu"),
         )
@@ -481,6 +706,8 @@ def run_final_train_and_test(
             "learning_rate_candidates": final_train_run.get("learning_rate_candidates"),
             "lr_search_results": final_train_run.get("lr_search_results", []),
             "history": final_train_run.get("history", []),
+            "threshold_source": "development_internal_validation",
+            "threshold_optimization": threshold_info,
         }
 
     else:
@@ -488,9 +715,11 @@ def run_final_train_and_test(
 
     predictions_df = pd.DataFrame({
         "timestamp": ts_test.astype(str),
+        "endpoint_index": test_label_diagnostics["endpoint_indices"],
         "y_true": y_test,
         "y_prob": test_results["y_prob"],
         "y_pred": test_results["y_pred"],
+        "probability_threshold": selected_probability_threshold,
     })
 
     return {
@@ -498,14 +727,101 @@ def run_final_train_and_test(
         "model_family": model_family,
         "scaler_name": scaler_name,
         "threshold": final_threshold,
+        "label_threshold_quantile": float(labeling_cfg["threshold_quantile"]),
+        "lookback": int(seq_cfg["lookback"]),
+        "selected_probability_threshold": selected_probability_threshold,
         "metrics": test_results["metrics"],
         "n_dev_samples": int(len(y_dev)),
         "n_test_samples": int(len(y_test)),
         "dev_label_distribution": dev_label_summary.reset_index().to_dict(orient="records"),
         "test_label_distribution": test_label_summary.reset_index().to_dict(orient="records"),
+        "dev_label_diagnostics": dev_label_diagnostics,
+        "test_label_diagnostics": test_label_diagnostics,
+        "baselines": compute_naive_baselines(
+            context_df=full_context_df,
+            y_true=y_test,
+            endpoint_indices=test_label_diagnostics["endpoint_indices"],
+            close_col=data_cfg["close_col"],
+            seed=int(config["experiment"]["seed"]),
+        ),
         "final_train_info": final_train_info,
         "predictions_df": predictions_df,
     }
+
+
+def _as_candidate_list(config_section: Dict[str, Any], candidate_key: str, fallback_key: str) -> List[Any]:
+    candidates = config_section.get(candidate_key)
+    if candidates is None:
+        candidates = [config_section[fallback_key]]
+    if isinstance(candidates, (str, int, float)):
+        candidates = [candidates]
+    return list(candidates)
+
+
+def build_experiment_config_variants(config: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Expand lightweight labeling/lookback candidate grids into config variants."""
+    labeling_candidates = _as_candidate_list(
+        config["labeling"],
+        "threshold_quantile_candidates",
+        "threshold_quantile",
+    )
+    lookback_candidates = _as_candidate_list(
+        config["sequence"],
+        "lookback_candidates",
+        "lookback",
+    )
+
+    variants = []
+    for threshold_quantile in labeling_candidates:
+        for lookback in lookback_candidates:
+            variant = deepcopy(config)
+            variant["labeling"]["threshold_quantile"] = float(threshold_quantile)
+            variant["sequence"]["lookback"] = int(lookback)
+            variants.append(variant)
+    return variants
+
+
+def make_variant_tag(config: Dict[str, Any]) -> str:
+    q_tag = int(round(float(config["labeling"]["threshold_quantile"]) * 100))
+    lookback = int(config["sequence"]["lookback"])
+    return f"q{q_tag:02d}_lb{lookback}"
+
+
+def summarize_labeling_candidates(
+    df: pd.DataFrame,
+    close_col: str,
+    horizon: int,
+    quantiles: List[float],
+    bull_label: int,
+    bear_label: int,
+    neutral_label: int,
+) -> List[Dict[str, Any]]:
+    returns = compute_forward_return(df[close_col], horizon=horizon)
+    summaries = []
+    for quantile in quantiles:
+        threshold = compute_threshold(
+            train_returns=returns,
+            method="quantile",
+            quantile=float(quantile),
+        )
+        labels = make_labels(
+            returns=returns,
+            threshold=threshold,
+            bull_label=bull_label,
+            bear_label=bear_label,
+            neutral_label=neutral_label,
+        )
+        distribution = summarize_label_distribution(labels).reset_index().to_dict(orient="records")
+        counts = labels.value_counts().to_dict()
+        summaries.append({
+            "threshold_quantile": float(quantile),
+            "threshold": float(threshold),
+            "distribution": distribution,
+            "n_bull": int(counts.get(bull_label, 0)),
+            "n_bear": int(counts.get(bear_label, 0)),
+            "n_neutral": int(counts.get(neutral_label, 0)),
+        })
+    return summaries
 
 
 def main(config_path: str = "configs/base.yaml") -> Dict[str, Any]:
@@ -546,27 +862,48 @@ def main(config_path: str = "configs/base.yaml") -> Dict[str, Any]:
 
     cv_results: List[Dict[str, Any]] = []
     skipped_models: List[Dict[str, Any]] = []
+    config_variants = build_experiment_config_variants(config)
+    labeling_quantiles = sorted({
+        float(variant["labeling"]["threshold_quantile"])
+        for variant in config_variants
+    })
+    labeling_diagnostics = summarize_labeling_candidates(
+        df=dev_df,
+        close_col=config["data"]["close_col"],
+        horizon=int(config["labeling"]["horizon"]),
+        quantiles=labeling_quantiles,
+        bull_label=int(config["labeling"]["bull_label"]),
+        bear_label=int(config["labeling"]["bear_label"]),
+        neutral_label=int(config["labeling"]["neutral_label"]),
+    )
 
-    for model_name in config["models"]["enabled"]:
-        for scaler_name in config["preprocessing"]["scalers"]:
-            try:
-                cv_result = run_cv_for_model_and_scaler(
-                    config=config,
-                    dev_df=dev_df,
-                    model_name=model_name,
-                    scaler_name=scaler_name,
-                )
-                cv_results.append(cv_result)
+    for variant_config in config_variants:
+        variant_tag = make_variant_tag(variant_config)
+        for model_name in variant_config["models"]["enabled"]:
+            for scaler_name in variant_config["preprocessing"]["scalers"]:
+                try:
+                    cv_result = run_cv_for_model_and_scaler(
+                        config=variant_config,
+                        dev_df=dev_df,
+                        model_name=model_name,
+                        scaler_name=scaler_name,
+                    )
+                    cv_result["variant_tag"] = variant_tag
+                    cv_result["config_snapshot"] = variant_config
+                    cv_results.append(cv_result)
 
-                fold_json_path = artifact_root / "metrics" / f"{experiment_name}_{model_name}_{scaler_name}_folds.json"
-                save_fold_results(cv_result["fold_results"], fold_json_path)
+                    fold_json_path = artifact_root / "metrics" / f"{experiment_name}_{variant_tag}_{model_name}_{scaler_name}_folds.json"
+                    save_fold_results(cv_result["fold_results"], fold_json_path)
 
-            except Exception as exc:
-                skipped_models.append({
-                    "model_name": model_name,
-                    "scaler_name": scaler_name,
-                    "reason": f"{type(exc).__name__}: {exc}",
-                })
+                except Exception as exc:
+                    skipped_models.append({
+                        "variant_tag": variant_tag,
+                        "model_name": model_name,
+                        "scaler_name": scaler_name,
+                        "threshold_quantile": float(variant_config["labeling"]["threshold_quantile"]),
+                        "lookback": int(variant_config["sequence"]["lookback"]),
+                        "reason": f"{type(exc).__name__}: {exc}",
+                    })
 
     if not cv_results:
         raise RuntimeError(
@@ -574,9 +911,10 @@ def main(config_path: str = "configs/base.yaml") -> Dict[str, Any]:
         )
 
     best_cv = select_best_cv_result(cv_results=cv_results, primary_metric=primary_metric)
+    best_config = best_cv["config_snapshot"]
 
     final_test = run_final_train_and_test(
-        config=config,
+        config=best_config,
         dev_df=dev_df,
         test_df=test_df,
         model_name=best_cv["model_name"],
@@ -598,6 +936,9 @@ def main(config_path: str = "configs/base.yaml") -> Dict[str, Any]:
                 "model_name": r["model_name"],
                 "model_family": r["model_family"],
                 "scaler_name": r["scaler_name"],
+                "variant_tag": r["variant_tag"],
+                "threshold_quantile": r["label_threshold_quantile"],
+                "lookback": r["lookback"],
                 "cv_summary": r["cv_summary"],
             }
             for r in cv_results
@@ -606,8 +947,12 @@ def main(config_path: str = "configs/base.yaml") -> Dict[str, Any]:
             "model_name": best_cv["model_name"],
             "model_family": best_cv["model_family"],
             "scaler_name": best_cv["scaler_name"],
+            "variant_tag": best_cv["variant_tag"],
+            "threshold_quantile": best_cv["label_threshold_quantile"],
+            "lookback": best_cv["lookback"],
             "cv_summary": best_cv["cv_summary"],
         },
+        "labeling_diagnostics": labeling_diagnostics,
         "final_test": {
             k: v for k, v in final_test.items() if k != "predictions_df"
         },
@@ -618,7 +963,7 @@ def main(config_path: str = "configs/base.yaml") -> Dict[str, Any]:
     save_experiment_report(report, report_path)
     append_experiment_summary(report, artifact_root.parent / "experiments_summary.csv")
 
-    print(f"[OK] Best model: {best_cv['model_name']} | family: {best_cv['model_family']} | scaler: {best_cv['scaler_name']}")
+    print(f"[OK] Best model: {best_cv['model_name']} | family: {best_cv['model_family']} | scaler: {best_cv['scaler_name']} | variant: {best_cv['variant_tag']}")
     print(f"[OK] Test MCC: {final_test['metrics']['mcc']:.6f}")
     print(f"[OK] Report: {report_path}")
     print(f"[OK] Predictions: {predictions_path}")

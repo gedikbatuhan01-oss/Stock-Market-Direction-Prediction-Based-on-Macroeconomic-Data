@@ -1,11 +1,11 @@
 from __future__ import annotations
 
-from copy import deepcopy
 from typing import Any, Dict, Optional
 
 import numpy as np
 from sklearn.metrics import (
     accuracy_score,
+    average_precision_score,
     balanced_accuracy_score,
     confusion_matrix,
     f1_score,
@@ -31,7 +31,7 @@ def compute_classification_metrics(
     - precision
     - recall
     - mcc
-    - roc_auc (if probabilities are provided and valid)
+    - roc_auc and pr_auc (if probabilities are provided and valid)
     - confusion_matrix
     """
     y_true = np.asarray(y_true)
@@ -67,8 +67,14 @@ def compute_classification_metrics(
             results["roc_auc"] = float(roc_auc_score(y_true, y_prob))
         except ValueError:
             results["roc_auc"] = None
+
+        try:
+            results["pr_auc"] = float(average_precision_score(y_true, y_prob))
+        except ValueError:
+            results["pr_auc"] = None
     else:
         results["roc_auc"] = None
+        results["pr_auc"] = None
 
     return results
 
@@ -88,6 +94,7 @@ def summarize_fold_metrics(fold_metrics: list[Dict[str, Any]]) -> Dict[str, Any]
         "recall",
         "mcc",
         "roc_auc",
+        "pr_auc",
     ]
 
     summary: Dict[str, Any] = {

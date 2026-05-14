@@ -209,6 +209,20 @@ These rules are enforced throughout the entire pipeline to prevent data leakage:
 
 ## References
 
+Additional sources and repositories used for the MCC/F1 improvement and notebook synchronization work:
+
+- Boughorbel et al. (2017) - *Optimal classifier for imbalanced data using Matthews Correlation Coefficient metric*
+  Source: https://journals.plos.org/plosone/article?id=10.1371/journal.pone.0177678
+- Chicco & Jurman (2020) - *The advantages of the Matthews correlation coefficient (MCC) over F1 score and accuracy*
+  Source: https://link.springer.com/article/10.1186/s12864-019-6413-7
+- Ghosh et al. (2020) - *Forecasting directional movements of stock prices for intraday trading using LSTM and random forests*
+  Paper: https://arxiv.org/abs/2004.10178
+  Repository: https://github.com/pushpendughosh/Stock-market-forecasting
+- Microsoft Qlib - AI-oriented quantitative investment platform and model benchmark workflows
+  Repository: https://github.com/microsoft/qlib
+- MLFinPy documentation - financial labeling methods, including fixed-horizon and triple-barrier labeling
+  Documentation: https://mlfinpy.readthedocs.io/en/stable/Labelling.html
+
 1. Chung et al. (2014) — *Empirical Evaluation of Gated Recurrent Neural Networks on Sequence Modeling*
 2. Fischer & Krauss (2018) — *Deep learning with long short-term memory networks for financial market predictions*
 3. Kingma & Ba (2015) — *Adam: A Method for Stochastic Optimization*

@@ -824,8 +824,8 @@ def summarize_labeling_candidates(
     return summaries
 
 
-def main(config_path: str = "configs/base.yaml") -> Dict[str, Any]:
-    config = load_config(config_path)
+def main(config_path: str = "configs/base.yaml", config_overrides=None) -> Dict[str, Any]:
+    config = load_config(config_path, overrides=config_overrides)
     set_global_seed(int(config["experiment"]["seed"]))
 
     artifact_root = Path(config["artifacts"]["root_dir"])

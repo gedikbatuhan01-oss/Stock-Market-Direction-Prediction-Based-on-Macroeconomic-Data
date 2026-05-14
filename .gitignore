@@ -1,0 +1,43 @@
+# ─── Python ───
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+*.egg
+
+# ─── Virtual Environments ───
+venv/
+.venv/
+env/
+.env/
+
+# ─── Jupyter ───
+.ipynb_checkpoints/
+
+# ─── IDE ───
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# ─── OS ───
+Thumbs.db
+.DS_Store
+desktop.ini
+
+# ─── Project Specific ───
+artifacts/
+data/processed/
+data/raw/*.csv
+experiments_summary.csv
+
+# ─── Model Checkpoints ───
+*.pt
+*.pth
+*.pkl
+*.joblib
+
+# ─── Logs ───
+*.log

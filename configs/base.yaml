@@ -1,0 +1,87 @@
+# ============================================================
+# base.yaml — Default experiment configuration
+# ============================================================
+# Tüm modüller bu dosyadan beslenir.
+# Override dosyaları (model_logreg.yaml vb.) sadece farkları taşır.
+# ============================================================
+
+experiment:
+  name: baseline_bull_bear
+  seed: 42
+  notes: "Initial chronological bull/bear classification baseline"
+
+data:
+  file_path: data/raw/market_data_10y_enriched.csv
+  date_col: Date
+  close_col: Nasdaq_Close
+  feature_cols:
+    - VIX_Term_Structure
+    - Yield_Curve
+    - SKEW_Index
+    - Risk_Appetite_Ratio
+    - Crude_Oil
+    - VWAP_Deviation
+    - Volume_Momentum
+
+split:
+  final_test_ratio: 0.15
+  method: expanding
+  n_folds: 4
+  val_ratio_within_dev: 0.10
+
+labeling:
+  horizon: 1
+  threshold_method: quantile
+  threshold_quantile: 0.40
+  neutral_policy: drop
+  bull_label: 1
+  bear_label: 0
+  neutral_label: -1
+
+sequence:
+  lookback: 21
+  flatten_for_tabular: true
+
+preprocessing:
+  missing_policy: ffill_then_drop_head
+  scalers:
+    - standard
+    - robust
+
+decision:
+  probability_threshold: 0.50
+
+training:
+  batch_size: 64
+  max_epochs: 100
+  early_stopping_patience: 10
+  learning_rate: 0.001
+  monitor_metric: mcc
+
+evaluation:
+  primary_metric: mcc
+  secondary_metrics:
+    - f1
+    - balanced_accuracy
+
+models:
+  enabled:
+    - logreg
+    - gru
+
+logreg:
+  class_weight: balanced
+  max_iter: 2000
+  solver: lbfgs
+
+gru:
+  hidden_dim: 64
+  num_layers: 1
+  dropout: 0.2
+  weighted_loss: true
+
+artifacts:
+  root_dir: artifacts
+  save_fold_reports: true
+  save_test_predictions: true
+  save_model_checkpoints: true

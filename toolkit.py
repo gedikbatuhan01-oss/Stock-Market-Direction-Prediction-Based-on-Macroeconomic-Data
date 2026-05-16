@@ -28,6 +28,7 @@ REPO_URL = (
     "https://github.com/gedikbatuhan01-oss/"
     "Stock-Market-Direction-Prediction-Based-on-Macroeconomic-Data.git"
 )
+REPO_BRANCH = "feature/notebooks-sync"
 DRIVE_PROJECT = Path("/content/drive/MyDrive/ANN-Project")
 REPO_DIR = Path("/content/repo")
 
@@ -41,11 +42,16 @@ def _mount_drive() -> None:
 
 def _clone_or_pull() -> None:
     if REPO_DIR.exists():
-        print(">> Repo güncelleniyor (git pull)...")
-        subprocess.run(["git", "-C", str(REPO_DIR), "pull"], check=True)
+        print(f">> Repo güncelleniyor (git pull, branch: {REPO_BRANCH})...")
+        subprocess.run(["git", "-C", str(REPO_DIR), "fetch", "origin", REPO_BRANCH], check=True)
+        subprocess.run(["git", "-C", str(REPO_DIR), "checkout", REPO_BRANCH], check=True)
+        subprocess.run(["git", "-C", str(REPO_DIR), "pull", "origin", REPO_BRANCH], check=True)
     else:
-        print(">> Repo clone ediliyor...")
-        subprocess.run(["git", "clone", REPO_URL, str(REPO_DIR)], check=True)
+        print(f">> Repo clone ediliyor (branch: {REPO_BRANCH})...")
+        subprocess.run(
+            ["git", "clone", "--branch", REPO_BRANCH, REPO_URL, str(REPO_DIR)],
+            check=True,
+        )
 
 
 def _install_deps() -> None:

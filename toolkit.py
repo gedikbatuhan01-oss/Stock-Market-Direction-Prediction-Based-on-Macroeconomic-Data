@@ -92,9 +92,9 @@ def setup() -> Path:
     return REPO_DIR
 
 
-def run(models: list[str] | None = None, config: str = "configs/base.yaml") -> dict:
+def run(models: list[str] | None = None, config: str = "configs/base.yaml") -> None:
     """
-    Deneyi çalıştır.
+    Deneyi çalıştır. Çıktı gerçek zamanlı görünür.
 
     Args:
         models: Çalıştırılacak modeller listesi. None ise config'deki tüm modeller.
@@ -102,13 +102,20 @@ def run(models: list[str] | None = None, config: str = "configs/base.yaml") -> d
         config: Config dosyası yolu (repo köküne göre).
     """
     setup()
-    overrides = {"models": {"enabled": models}} if models else None
 
-    from src.run_experiment import main
-    report = main(config, config_overrides=overrides)
+    cmd = [sys.executable, "-u", "-m", "src.run_experiment", "--config", config]
+    if models:
+        cmd += ["--models"] + models
+
+    env = os.environ.copy()
+    env["PYTHONUNBUFFERED"] = "1"
+
+    result = subprocess.run(cmd, cwd=str(REPO_DIR), env=env)
+
+    if result.returncode != 0:
+        raise RuntimeError(f"run_experiment başarısız oldu (exit code {result.returncode})")
 
     _save_artifacts_to_drive()
-    return report
 
 
 def _save_artifacts_to_drive() -> None:

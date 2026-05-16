@@ -977,4 +977,17 @@ def main(config_path: str = "configs/base.yaml", config_overrides=None) -> Dict[
 
 
 if __name__ == "__main__":
-    main()
+    import argparse
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--config", default="configs/base.yaml")
+    parser.add_argument(
+        "--models",
+        nargs="+",
+        default=None,
+        help="Override enabled models, e.g. --models gru lstm transformer",
+    )
+    args = parser.parse_args()
+
+    overrides = {"models": {"enabled": args.models}} if args.models else None
+    main(args.config, config_overrides=overrides)

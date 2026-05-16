@@ -148,7 +148,7 @@ def show_results() -> None:
     print("=" * 58)
     print("TÜM MODEL SONUÇLARI (CV)")
     print("=" * 58)
-    cv_results = report.get("cv_results", [])
+    cv_results = report.get("cv_results") or report.get("cv_candidates", [])
     if cv_results:
         print(f"{'Model':<18} {'Scaler':<12} {'MCC':>8} {'F1':>8} {'BalAcc':>8}")
         print("-" * 58)

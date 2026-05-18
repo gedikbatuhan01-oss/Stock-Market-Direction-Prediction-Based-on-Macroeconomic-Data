@@ -24,20 +24,26 @@ class CNN1DClassifier(nn.Module):
         conv_channels: int = 32,
         kernel_size: int = 3,
         dropout: float = 0.2,
+        num_conv_layers: int = 2,
     ) -> None:
         super().__init__()
 
+        if num_conv_layers < 1:
+            raise ValueError("num_conv_layers must be at least 1.")
+
         padding = kernel_size // 2
 
-        self.feature_extractor = nn.Sequential(
-            nn.Conv1d(input_channels, conv_channels, kernel_size=kernel_size, padding=padding),
-            nn.ReLU(),
-            nn.BatchNorm1d(conv_channels),
-            nn.Conv1d(conv_channels, conv_channels, kernel_size=kernel_size, padding=padding),
-            nn.ReLU(),
-            nn.BatchNorm1d(conv_channels),
-            nn.AdaptiveAvgPool1d(1),
-        )
+        layers = []
+        in_ch = input_channels
+        for _ in range(num_conv_layers):
+            layers.extend([
+                nn.Conv1d(in_ch, conv_channels, kernel_size=kernel_size, padding=padding),
+                nn.ReLU(),
+                nn.BatchNorm1d(conv_channels),
+            ])
+            in_ch = conv_channels
+        layers.append(nn.AdaptiveAvgPool1d(1))
+        self.feature_extractor = nn.Sequential(*layers)
 
         self.dropout = nn.Dropout(dropout)
         self.classifier = nn.Linear(conv_channels, 1)
@@ -77,5 +83,6 @@ def build_cnn1d_model(
         conv_channels=int(cnn_cfg.get("conv_channels", 32)),
         kernel_size=int(cnn_cfg.get("kernel_size", 3)),
         dropout=float(cnn_cfg.get("dropout", 0.2)),
+        num_conv_layers=int(cnn_cfg.get("num_conv_layers", 2)),
     )
     return model

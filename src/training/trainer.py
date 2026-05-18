@@ -32,6 +32,91 @@ def predict_labels_from_proba(
     return (y_prob >= threshold).astype(np.int64)
 
 
+def build_probability_threshold_grid(
+    start: float = 0.05,
+    stop: float = 0.95,
+    step: float = 0.01,
+) -> np.ndarray:
+    """Create an inclusive probability-threshold grid."""
+    if not 0.0 <= start <= stop <= 1.0:
+        raise ValueError("threshold grid must satisfy 0 <= start <= stop <= 1.")
+    if step <= 0:
+        raise ValueError("threshold grid step must be positive.")
+
+    n_steps = int(np.floor((stop - start) / step)) + 1
+    grid = start + (np.arange(n_steps + 1) * step)
+    grid = grid[grid <= stop + 1e-12]
+    return np.round(grid, 6)
+
+
+def optimize_probability_threshold(
+    y_true: np.ndarray,
+    y_prob: np.ndarray,
+    thresholds: Optional[np.ndarray] = None,
+    metric: str = "mcc",
+    default_threshold: float = 0.50,
+) -> Dict[str, Any]:
+    """
+    Pick the probability threshold that maximizes a validation metric.
+
+    Ties are resolved toward the configured default threshold to avoid selecting
+    an extreme threshold when performance is identical.
+    """
+    y_true = np.asarray(y_true)
+    y_prob = np.asarray(y_prob)
+
+    if y_true.ndim != 1 or y_prob.ndim != 1:
+        raise ValueError("y_true and y_prob must be 1D arrays.")
+    if len(y_true) != len(y_prob):
+        raise ValueError("y_true and y_prob must have the same length.")
+
+    if thresholds is None:
+        thresholds = build_probability_threshold_grid()
+    thresholds = np.asarray(thresholds, dtype=float)
+
+    curve = []
+    best_item: Optional[Dict[str, Any]] = None
+
+    for threshold in thresholds:
+        y_pred = predict_labels_from_proba(y_prob, threshold=float(threshold))
+        metrics = compute_classification_metrics(y_true=y_true, y_pred=y_pred, y_prob=y_prob)
+        score = metrics.get(metric)
+        score_for_sort = float("-inf") if score is None else float(score)
+
+        item = {
+            "threshold": float(threshold),
+            "score": score,
+            "metric": metric,
+            "metrics": metrics,
+        }
+        curve.append(item)
+
+        if best_item is None:
+            best_item = item
+            continue
+
+        best_score = best_item.get("score")
+        best_score_for_sort = float("-inf") if best_score is None else float(best_score)
+        is_better = score_for_sort > best_score_for_sort
+        is_tie_nearer_default = (
+            score_for_sort == best_score_for_sort
+            and abs(float(threshold) - default_threshold) < abs(float(best_item["threshold"]) - default_threshold)
+        )
+        if is_better or is_tie_nearer_default:
+            best_item = item
+
+    if best_item is None:
+        raise RuntimeError("No threshold candidate could be evaluated.")
+
+    return {
+        "selected_threshold": float(best_item["threshold"]),
+        "selected_metric": metric,
+        "selected_score": best_item.get("score"),
+        "default_threshold": float(default_threshold),
+        "curve": curve,
+    }
+
+
 # =========================================================
 # sklearn-style training / evaluation
 # =========================================================
@@ -424,6 +509,7 @@ def _train_torch_model_once(
     learning_rate = float(training_config.get("_active_learning_rate", training_config.get("learning_rate", 1e-3)))
     patience = int(training_config.get("early_stopping_patience", 10))
     min_delta = float(training_config.get("early_stopping_min_delta", 0.0))
+    shuffle_train = bool(training_config.get("shuffle_train", False))
 
     model = model.to(device)
 
@@ -431,7 +517,7 @@ def _train_torch_model_once(
         X=X_train,
         y=y_train,
         batch_size=batch_size,
-        shuffle=False,
+        shuffle=shuffle_train,
     )
 
     loss_fn = build_bce_with_logits_loss(

@@ -1,0 +1,216 @@
+experiment:
+  name: x7_fwd5
+  seed: 42
+  notes: X7 100-feature pipeline (fwd_n=5)
+data:
+  file_path: data/raw/market_data_x7_fwd5.csv
+  date_col: Date
+  close_col: Nasdaq_Close
+  feature_cols:
+  - vrvp_poc_dist
+  - vrvp_vah_dist
+  - vrvp_val_dist
+  - ichi_sa_dist
+  - ichi_sb_dist
+  - ichi_tk_cross
+  - ichi_cloud_thick
+  - nw_mid_dist
+  - nw_upper_dist
+  - nw_lower_dist
+  - kama_dist
+  - kama_er
+  - st_direction
+  - st_lower_dist
+  - st_upper_dist
+  - st_atr_pct
+  - vrvp_poc_dist__delta_5
+  - vrvp_poc_dist__delta_21
+  - vrvp_poc_dist__ewm_5
+  - vrvp_poc_dist__ewm_21
+  - vrvp_poc_dist__residual_21
+  - vrvp_poc_dist__rolling_z_21
+  - vrvp_vah_dist__delta_5
+  - vrvp_vah_dist__delta_21
+  - vrvp_vah_dist__ewm_5
+  - vrvp_vah_dist__ewm_21
+  - vrvp_vah_dist__residual_21
+  - vrvp_vah_dist__rolling_z_21
+  - vrvp_val_dist__delta_5
+  - vrvp_val_dist__delta_21
+  - vrvp_val_dist__ewm_5
+  - vrvp_val_dist__ewm_21
+  - vrvp_val_dist__residual_21
+  - vrvp_val_dist__rolling_z_21
+  - ichi_sa_dist__delta_5
+  - ichi_sa_dist__delta_21
+  - ichi_sa_dist__ewm_5
+  - ichi_sa_dist__ewm_21
+  - ichi_sa_dist__residual_21
+  - ichi_sa_dist__rolling_z_21
+  - ichi_sb_dist__delta_5
+  - ichi_sb_dist__delta_21
+  - ichi_sb_dist__ewm_5
+  - ichi_sb_dist__ewm_21
+  - ichi_sb_dist__residual_21
+  - ichi_sb_dist__rolling_z_21
+  - ichi_cloud_thick__delta_5
+  - ichi_cloud_thick__delta_21
+  - ichi_cloud_thick__ewm_5
+  - ichi_cloud_thick__ewm_21
+  - ichi_cloud_thick__residual_21
+  - ichi_cloud_thick__rolling_z_21
+  - nw_mid_dist__delta_5
+  - nw_mid_dist__delta_21
+  - nw_mid_dist__ewm_5
+  - nw_mid_dist__ewm_21
+  - nw_mid_dist__residual_21
+  - nw_mid_dist__rolling_z_21
+  - nw_upper_dist__delta_5
+  - nw_upper_dist__delta_21
+  - nw_upper_dist__ewm_5
+  - nw_upper_dist__ewm_21
+  - nw_upper_dist__residual_21
+  - nw_upper_dist__rolling_z_21
+  - nw_lower_dist__delta_5
+  - nw_lower_dist__delta_21
+  - nw_lower_dist__ewm_5
+  - nw_lower_dist__ewm_21
+  - nw_lower_dist__residual_21
+  - nw_lower_dist__rolling_z_21
+  - kama_dist__delta_5
+  - kama_dist__delta_21
+  - kama_dist__ewm_5
+  - kama_dist__ewm_21
+  - kama_dist__residual_21
+  - kama_dist__rolling_z_21
+  - kama_er__delta_5
+  - kama_er__delta_21
+  - kama_er__ewm_5
+  - kama_er__ewm_21
+  - kama_er__residual_21
+  - kama_er__rolling_z_21
+  - st_lower_dist__delta_5
+  - st_lower_dist__delta_21
+  - st_lower_dist__ewm_5
+  - st_lower_dist__ewm_21
+  - st_lower_dist__residual_21
+  - st_lower_dist__rolling_z_21
+  - st_upper_dist__delta_5
+  - st_upper_dist__delta_21
+  - st_upper_dist__ewm_5
+  - st_upper_dist__ewm_21
+  - st_upper_dist__residual_21
+  - st_upper_dist__rolling_z_21
+  - st_atr_pct__delta_5
+  - st_atr_pct__delta_21
+  - st_atr_pct__ewm_5
+  - st_atr_pct__ewm_21
+  - st_atr_pct__residual_21
+  - st_atr_pct__rolling_z_21
+split:
+  final_test_ratio: 0.15
+  method: expanding
+  n_folds: 4
+  val_ratio_within_dev: 0.1
+labeling:
+  horizon: 5
+  threshold_method: quantile
+  threshold_quantile: 0.4
+  threshold_quantile_candidates:
+  - 0.2
+  - 0.3
+  - 0.4
+  - 0.5
+  neutral_policy: drop
+  bull_label: 1
+  bear_label: 0
+  neutral_label: -1
+sequence:
+  lookback: 21
+  lookback_candidates:
+  - 5
+  - 10
+  - 21
+  - 42
+  flatten_for_tabular: true
+preprocessing:
+  missing_policy: ffill_then_drop_head
+  scalers:
+  - standard
+  - robust
+decision:
+  probability_threshold: 0.5
+  threshold_search:
+    enabled: true
+    metric: mcc
+    start: 0.05
+    stop: 0.95
+    step: 0.01
+training:
+  batch_size: 64
+  max_epochs: 100
+  early_stopping_patience: 10
+  learning_rate: 0.001
+  learning_rate_candidates:
+  - 0.0001
+  - 0.0003
+  - 0.001
+  shuffle_train: true
+  monitor_metric: mcc
+evaluation:
+  primary_metric: mcc
+  secondary_metrics:
+  - f1
+  - balanced_accuracy
+models:
+  enabled:
+  - logreg
+  - random_forest
+  - xgboost
+  - lightgbm
+  - catboost
+  - gru
+  - cnn1d
+logreg:
+  class_weight: balanced
+  max_iter: 2000
+  solver: lbfgs
+random_forest:
+  n_estimators: 500
+  min_samples_leaf: 5
+  max_features: sqrt
+  class_weight: balanced
+xgboost:
+  n_estimators: 400
+  max_depth: 3
+  learning_rate: 0.03
+  subsample: 0.8
+  colsample_bytree: 0.8
+  eval_metric: logloss
+lightgbm:
+  n_estimators: 400
+  learning_rate: 0.03
+  num_leaves: 31
+  class_weight: balanced
+catboost:
+  iterations: 400
+  depth: 4
+  learning_rate: 0.03
+  eval_metric: MCC
+  auto_class_weights: Balanced
+  allow_writing_files: false
+gru:
+  hidden_dim: 64
+  num_layers: 1
+  dropout: 0.2
+  weighted_loss: true
+cnn1d:
+  conv_channels: 64
+  kernel_size: 3
+  dropout: 0.2
+  weighted_loss: true
+artifacts:
+  root_dir: artifacts
+  save_fold_reports: true
+  save_test_predictions: true
+  save_model_checkpoints: true
